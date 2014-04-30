@@ -1,0 +1,937 @@
+/**************************************************************************/
+/*                                                                        */
+/*  IBM System i and System p Virtual NIC Device Driver                   */
+/*  Copyright (C) 2014 IBM Corp.                                          */
+/*  Santiago Leon (santil@linux.vnet.ibm.com)                             */
+/*                                                                        */
+/*  This program is free software; you can redistribute it and/or modify  */
+/*  it under the terms of the GNU General Public License as published by  */
+/*  the Free Software Foundation; either version 2 of the License, or     */
+/*  (at your option) any later version.                                   */
+/*                                                                        */
+/*  This program is distributed in the hope that it will be useful,       */
+/*  but WITHOUT ANY WARRANTY; without even the implied warranty of        */
+/*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         */
+/*  GNU General Public License for more details.                          */
+/*                                                                        */
+/*  You should have received a copy of the GNU General Public License     */
+/*  along with this program; if not, write to the Free Software           */
+/*  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  */
+/*                                                                   USA  */
+/*                                                                        */
+/* This module contains the implementation of a virtual ethernet device   */
+/* for use with IBM i/pSeries LPAR Linux.  It utilizes the logical LAN    */
+/* option of the RS/6000 Platform Architechture to interface with virtual */
+/* ethernet NICs that are presented to the partition by the hypervisor.   */
+/*                                                                        */
+/**************************************************************************/
+
+#define VNIC_NAME		"vnic"
+#define VNIC_DRIVER_VERSION	"0.037"
+#define VNIC_INVALID_MAP	-1
+#define VNIC_STATS_TIMEOUT	1
+#define VMIC_IO_ENTITLEMENT_DEFAULT	610305 /* basic structures plus
+						* 100 2k buffers */
+
+/* Initial module_parameters */
+#define VNIC_RX_WEIGHT		16
+#define VNIC_BUFFS_PER_POOL	100  /* when changing this, update
+				      * VMIC_IO_ENTITLEMENT_DEFAULT */
+#define VNIC_MAX_TX_QUEUES	4
+
+struct vnic_login_buffer {
+	__be32 len;
+	__be32 version;
+#define INITIAL_VERSION_LB 1
+	__be32 num_txcomp_subcrqs;
+	__be32 off_txcomp_subcrqs;
+	__be32 num_rxcomp_subcrqs;
+	__be32 off_rxcomp_subcrqs;
+	__be32 login_rsp_ioba;
+	__be32 login_rsp_len;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_login_rsp_buffer {
+	__be32 len;
+	__be32 version;
+#define INITIAL_VERSION_LRB 1
+	__be32 num_txsubm_subcrqs;
+	__be32 off_txsubm_subcrqs;
+	__be32 num_rxadd_subcrqs;
+	__be32 off_rxadd_subcrqs;
+	__be32 off_rxadd_buff_size;
+	__be32 num_supp_tx_desc;
+	__be32 off_supp_tx_desc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_query_ip_offload_buffer {
+	__be32 len;
+	__be32 version;
+#define INITIAL_VERSION_IOB 1
+	u8 ipv4_chksum;
+	u8 ipv6_chksum;
+	u8 tcp_ipv4_chksum;
+	u8 tcp_ipv6_chksum;
+	u8 udp_ipv4_chksum;
+	u8 udp_ipv6_chksum;
+	u8 large_tx_ipv4;
+	u8 large_tx_ipv6;
+	u8 large_rx_ipv4;
+	u8 large_rx_ipv6;
+	u8 reserved1[14];
+	__be16 max_ipv4_header_size;
+	__be16 max_ipv6_header_size;
+	__be16 max_tcp_header_size;
+	__be16 max_udp_header_size;
+	__be32 max_large_tx_size;
+	__be32 max_large_rx_size;
+	u8 reserved2[16];
+	u8 ipv6_extension_header;
+#define IPV6_EH_NOT_SUPPORTED	0x00
+#define IPV6_EH_SUPPORTED_LIM	0x01
+#define IPV6_EH_SUPPORTED	0xFF
+	u8 tcp_pseudosum_req;
+#define TCP_PS_NOT_REQUIRED	0x00
+#define TCP_PS_REQUIRED		0x01
+	u8 reserved3[30];
+	__be16 num_ipv6_ext_headers;
+	__be32 off_ipv6_ext_headers;
+	u8 reserved4[154];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_control_ip_offload_buffer {
+	__be32 len;
+	__be32 version;
+#define INITIAL_VERSION_IOB 1
+	u8 ipv4_chksum;
+	u8 ipv6_chksum;
+	u8 tcp_ipv4_chksum;
+	u8 tcp_ipv6_chksum;
+	u8 udp_ipv4_chksum;
+	u8 udp_ipv6_chksum;
+	u8 large_tx_ipv4;
+	u8 large_tx_ipv6;
+	u8 bad_packet_rx;
+	u8 large_rx_ipv4;
+	u8 large_rx_ipv6;
+	u8 reserved4[111];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_fw_component {
+	u8 name[48];
+	__be32 trace_buff_size;
+	u8 correlator;
+	u8 trace_level;
+	u8 parent_correlator;
+	u8 error_check_level;
+	u8 trace_on;
+	u8 reserved[7];
+	u8 description[192];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_fw_trace_entry {
+	__be32 trace_id;
+	u8 num_valid_data;
+	u8 reserved[3];
+	__be64 pmc_registers;
+	__be64 timebase;
+	__be64 trace_data[5];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_statistics {
+	__be32 version;
+	__be32 promiscuous;
+	__be64 rx_packets;
+	__be64 rx_bytes;
+	__be64 tx_packets;
+	__be64 tx_bytes;
+	__be64 ucast_tx_packets;
+	__be64 ucast_rx_packets;
+	__be64 mcast_tx_packets;
+	__be64 mcast_rx_packets;
+	__be64 bcast_tx_packets;
+	__be64 bcast_rx_packets;
+	__be64 align_errors;
+	__be64 fcs_errors;
+	__be64 single_collision_frames;
+	__be64 multi_collision_frames;
+	__be64 sqe_test_errors;
+	__be64 deferred_tx;
+	__be64 late_collisions;
+	__be64 excess_collisions;
+	__be64 internal_mac_tx_errors;
+	__be64 carrier_sense;
+	__be64 too_long_frames;
+	__be64 internal_mac_rx_errors;
+	u8 reserved[72];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_acl_buffer {
+	__be32 len;
+	__be32 version;
+#define INITIAL_VERSION_IOB 1
+	u8 mac_acls_restrict;
+	u8 vlan_acls_restrict;
+	u8 reserved1[22];
+	__be32 num_mac_addrs;
+	__be32 offset_mac_addrs;
+	__be32 num_vlan_ids;
+	__be32 offset_vlan_ids;
+	u8 reserved2[80];
+} __attribute__((packed, aligned(8)));
+
+#define VNIC_TX_DESC_VERSIONS 3
+struct vnic_tx_desc_v0 {
+	u8 type;
+	u8 version;
+#define VNIC_TX_DESC_V0 0
+	u8 flags1;
+#define VNIC_LARGE_TX		0x80
+#define VNIC_IP_CHKSUM		0x40
+#define VNIC_TCP_CHKSUM		0x20
+#define VNIC_INS_VLANH		0x10
+#define VNIC_UDP_CHKSUM		0x08
+#define VNIC_MULTI_TX_DESC	0x04
+#define VNIC_LAST_FRAG		0x02
+#define VNIC_TX_COMP_EVENT	0x01
+	u8 flags2;
+#define IPV6			0x80
+	__be16 tcp_udp_h_off;
+	__be16 vlan_h;
+	u8 reserved;
+	u8 mss_msb;
+	__be16 mss;
+	__be32 correlator;
+	__be32 ioba1;
+	__be32 len1;
+	__be32 ioba2;
+	__be32 len2;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_tx_comp_desc {
+	u8 type;
+	u8 num_comps;
+	__be16 rcs[5];
+	__be32 correlators[5];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_tx_desc_v1 {
+	u8 type;
+	u8 version;
+#define VNIC_TX_DESC_V1 1
+	u8 flags1; /* same as V0 */
+	u8 flags2; /* same as V0 */
+	__be16 tcp_udp_h_off;
+	__be16 vlan_h;
+	u8 reserved;
+	u8 mss[3];
+	__be32 correlator;
+	__be32 ioba1;
+	__be32 len1;
+	u8 dest_mac[6];
+	u8 ethertype;
+} __attribute__((packed, aligned(8)));
+
+#define VNIC_MAX_FRAGS_PER_CRQ 3
+struct vnic_tx_desc_v2 {
+	u8 type;
+	u8 version;
+#define VNIC_TX_DESC_V2 2
+	u8 flags1; /* only VNIC_LAST_FRAG and VNIC_TX_COMP_EVENT allowed here */
+	u8 reserved;
+	__be32 ioba1;
+	__be32 len1;
+	__be32 correlator;
+	__be32 ioba2;
+	__be32 len2;
+	__be32 ioba3;
+	__be32 len3;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_rx_desc {
+	u8 type;
+	u8 flags;
+#define VNIC_IP_CHKSUM_GOOD		0x80
+#define VNIC_TCP_UDP_CHKSUM_GOOD	0x40
+#define VNIC_END_FRAME			0x20
+#define VNIC_EXACT_MC			0x10
+#define VNIC_CSUM_FIELD			0x08
+	__be16 off_frame_data;
+	__be32 len;
+	__be64 correlator;
+	__be16 csum;
+	u8 reserved[14];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_generic_scrq {
+	u8 type;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_rx_buff_add_desc {
+	u8 type;
+	u8 reserved1[7];
+	__be64 correlator;
+	__be32 ioba;
+	__be32 len;
+	u8 reserved2[8];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_rc {
+	volatile u8 code; /* one of enum vnic_rc_codes */
+	volatile u8 detailed_data[3];
+} __attribute__((packed, aligned(4)));
+
+struct vnic_generic_crq {
+	u8 type;
+	u8 cmd;
+	u8 params[10];
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_version_exchange {
+	u8 type;
+	u8 cmd;
+	__be16 version;
+#define VNIC_INITIAL_VERSION 1
+	u8 reserved[8];
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_capability {
+	u8 type;
+	u8 cmd;
+	__be16 capability; /* one of vnic_capabilities */
+	struct vnic_rc rc;
+	__be32 number; /*FIX: should be __be64, but I'm getting the least
+		     * significant word first */
+} __attribute__((packed, aligned(8)));
+
+struct vnic_login {
+	u8 type;
+	u8 cmd;
+	u8 reserved[6];
+	__be32 ioba;
+	__be32 len;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_phys_parms {
+	u8 type;
+	u8 cmd;
+	u8 flags1;
+#define VNIC_EXTERNAL_LOOPBACK	0x80
+#define VNIC_INTERNAL_LOOPBACK	0x40
+#define VNIC_PROMISC		0x20
+#define VNIC_PHYS_LINK_ACTIVE	0x10
+#define VNIC_AUTONEG_DUPLEX	0x08
+#define VNIC_FULL_DUPLEX	0x04
+#define VNIC_HALF_DUPLEX	0x02
+#define VNIC_CAN_CHG_PHYS_PARMS	0x01
+	u8 flags2;
+#define VNIC_LOGICAL_LNK_ACTIVE 0x80
+	__be32 speed;
+#define VNIC_AUTONEG		0x80
+#define VNIC_10MBPS		0x40
+#define VNIC_100MBPS		0x20
+#define VNIC_1GBPS		0x10
+#define VNIC_10GBPS		0x08
+	__be32 mtu;
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_logical_link_state {
+	u8 type;
+	u8 cmd;
+	u8 link_state;
+#define VNIC_LOGICAL_LNK_DN 0x00
+#define VNIC_LOGICAL_LNK_UP 0x01
+#define VNIC_LOGICAL_LNK_QUERY 0xff
+	u8 reserved[9];
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_query_ip_offload {
+	u8 type;
+	u8 cmd;
+	u8 reserved[2];
+	__be32 len;
+	__be32 ioba;
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_control_ip_offload {
+	u8 type;
+	u8 cmd;
+	u8 reserved[2];
+	__be32 ioba;
+	__be32 len;
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_request_dump_size {
+	u8 type;
+	u8 cmd;
+	u8 reserved[6];
+	__be32 len;
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_request_dump {
+	u8 type;
+	u8 cmd;
+	u8 reserved1[2];
+	__be32 ioba;
+	__be32 len;
+	u8 reserved2[4];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_request_dump_rsp {
+	u8 type;
+	u8 cmd;
+	u8 reserved[6];
+	__be32 dumped_len;
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_request_ras_comp_num {
+	u8 type;
+	u8 cmd;
+	u8 reserved1[2];
+	__be32 num_components;
+	u8 reserved2[4];
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_request_ras_comps {
+	u8 type;
+	u8 cmd;
+	u8 reserved[2];
+	__be32 ioba;
+	__be32 len;
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_control_ras {
+	u8 type;
+	u8 cmd;
+	u8 correlator;
+	u8 level;
+	u8 op;
+#define VNIC_TRACE_LEVEL	1
+#define VNIC_ERROR_LEVEL	2
+#define VNIC_TRACE_PAUSE	3
+#define VNIC_TRACE_RESUME	4
+#define VNIC_TRACE_ON		5
+#define VNIC_TRACE_OFF		6
+#define VNIC_CHG_TRACE_BUFF_SZ	7
+	u8 trace_buff_sz[3];
+	u8 reserved[4];
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_collect_fw_trace {
+	u8 type;
+	u8 cmd;
+	u8 correlator;
+	u8 reserved;
+	__be32 ioba;
+	__be32 len;
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_request_statistics {
+	u8 type;
+	u8 cmd;
+	u8 flags;
+#define VNIC_PHYSICAL_PORT	0x80
+	u8 reserved1;
+	__be32 ioba;
+	__be32 len;
+	u8 reserved[4];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_request_debug_stats {
+	u8 type;
+	u8 cmd;
+	u8 reserved[2];
+	__be32 ioba;
+	__be32 len;
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_error_indication {
+	u8 type;
+	u8 cmd;
+	u8 flags;
+#define VNIC_FATAL_ERROR	0x80
+	u8 reserved1;
+	__be32 error_id;
+	__be32 detail_error_sz;
+	__be16 error_cause;
+	u8 reserved2[2];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_request_error_info {
+	u8 type;
+	u8 cmd;
+	u8 reserved[2];
+	__be32 ioba;
+	__be32 len;
+	__be32 error_id;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_request_error_rsp {
+	u8 type;
+	u8 cmd;
+	u8 reserved[2];
+	__be32 error_id;
+	__be32 len;
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_link_state_indication {
+	u8 type;
+	u8 cmd;
+	u8 reserved1[2];
+	u8 phys_link_state;
+	u8 logical_link_state;
+	u8 reserved2[10];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_change_mac_addr {
+	u8 type;
+	u8 cmd;
+	u8 mac_addr[6];
+	struct vnic_rc rc;
+	u8 reserved[4];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_multicast_ctrl {
+	u8 type;
+	u8 cmd;
+	u8 mac_addr[6];
+	u8 flags;
+#define VNIC_ENABLE_MC		0x80
+#define VNIC_DISABLE_MC		0x40
+#define VNIC_ENABLE_ALL		0x20
+#define VNIC_DISABLE_ALL	0x10
+	u8 reserved1;
+	__be16 reserved2; /* was num_enabled_mc_addr; */
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_get_vpd_size_rsp {
+	u8 type;
+	u8 cmd;
+	u8 reserved[2];
+	__be64 len;
+	struct vnic_rc rc;
+} __attribute__((packed, aligned(8)));
+
+struct vnic_get_vpd {
+	u8 type;
+	u8 cmd;
+	u8 reserved1[2];
+	__be32 ioba;
+	__be32 len;
+	u8 reserved[4];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_acl_change_indication {
+	u8 type;
+	u8 cmd;
+	__be16 change_type;
+#define VNIC_MAC_ACL 0;
+#define VNIC_VLAN_ACL 1;
+	u8 reserved[12];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_acl_query {
+	u8 type;
+	u8 cmd;
+	u8 reserved1[2];
+	__be32 ioba;
+	__be32 len;
+	u8 reserved2[4];
+} __attribute__((packed, aligned(8)));
+
+struct vnic_tune {
+	u8 type;
+	u8 cmd;
+	u8 reserved1[2];
+	__be32 ioba;
+	__be32 len;
+	u8 reserved2[4];
+} __attribute__((packed, aligned(8)));
+
+union vnic_crq {
+	struct vnic_generic_crq generic;
+	struct vnic_version_exchange version_exchange;
+	struct vnic_version_exchange version_exchange_rsp;
+	struct vnic_capability query_capability;
+	struct vnic_capability query_capability_rsp;
+	struct vnic_capability request_capability;
+	struct vnic_capability request_capability_rsp;
+	struct vnic_login login;
+	struct vnic_generic_crq login_rsp;
+	struct vnic_phys_parms query_phys_parms;
+	struct vnic_phys_parms query_phys_parms_rsp;
+	struct vnic_phys_parms query_phys_capabilities;
+	struct vnic_phys_parms query_phys_capabilities_rsp;
+	struct vnic_phys_parms set_phys_parms;
+	struct vnic_phys_parms set_phys_parms_rsp;
+	struct vnic_logical_link_state logical_link_state;
+	struct vnic_logical_link_state logical_link_state_rsp;
+	struct vnic_query_ip_offload query_ip_offload;
+	struct vnic_query_ip_offload query_ip_offload_rsp;
+	struct vnic_control_ip_offload control_ip_offload;
+	struct vnic_control_ip_offload control_ip_offload_rsp;
+	struct vnic_request_dump_size request_dump_size;
+	struct vnic_request_dump_size request_dump_size_rsp;
+	struct vnic_request_dump request_dump;
+	struct vnic_request_dump_rsp request_dump_rsp;
+	struct vnic_request_ras_comp_num request_ras_comp_num;
+	struct vnic_request_ras_comp_num request_ras_comp_num_rsp;
+	struct vnic_request_ras_comps request_ras_comps;
+	struct vnic_request_ras_comps request_ras_comps_rsp;
+	struct vnic_control_ras control_ras;
+	struct vnic_control_ras control_ras_rsp;
+	struct vnic_collect_fw_trace collect_fw_trace;
+	struct vnic_collect_fw_trace collect_fw_trace_rsp;
+	struct vnic_request_statistics request_statistics;
+	struct vnic_generic_crq request_statistics_rsp;
+	struct vnic_request_debug_stats request_debug_stats;
+	struct vnic_request_debug_stats request_debug_stats_rsp;
+	struct vnic_error_indication error_indication;
+	struct vnic_request_error_info request_error_info;
+	struct vnic_request_error_rsp request_error_rsp;
+	struct vnic_link_state_indication link_state_indication;
+	struct vnic_change_mac_addr change_mac_addr;
+	struct vnic_change_mac_addr change_mac_addr_rsp;
+	struct vnic_multicast_ctrl multicast_ctrl;
+	struct vnic_multicast_ctrl multicast_ctrl_rsp;
+	struct vnic_generic_crq get_vpd_size;
+	struct vnic_get_vpd_size_rsp get_vpd_size_rsp;
+	struct vnic_get_vpd get_vpd;
+	struct vnic_generic_crq get_vpd_rsp;
+	struct vnic_acl_change_indication acl_change_indication;
+	struct vnic_acl_query acl_query;
+	struct vnic_generic_crq acl_query_rsp;
+	struct vnic_tune tune;
+	struct vnic_generic_crq tune_rsp;
+};
+
+enum vnic_rc_codes {
+	SUCCESS = 0,
+	PARTIALSUCCESS = 1,
+	PERMISSION = 2,
+	NOMEMORY = 3,
+	PARAMETER = 4,
+	UNKNOWNCOMMAND = 5,
+	ABORTED = 6,
+	INVALIDSTATE = 7,
+	INVALIDIOBA = 8,
+	INVALIDLENGTH = 9,
+	UNSUPPORTEDOPTION = 10,
+};
+
+enum vnic_capabilities {
+	MIN_TX_QUEUES = 1,
+	MIN_RX_QUEUES = 2,
+	MIN_RX_ADD_QUEUES = 3,
+	MAX_TX_QUEUES = 4,
+	MAX_RX_QUEUES = 5,
+	MAX_RX_ADD_QUEUES = 6,
+	REQ_TX_QUEUES = 7,
+	REQ_RX_QUEUES = 8,
+	REQ_RX_ADD_QUEUES = 9,
+	MIN_TX_ENTRIES_PER_SUBCRQ = 10,
+	MIN_RX_ADD_ENTRIES_PER_SUBCRQ = 11,
+	MAX_TX_ENTRIES_PER_SUBCRQ = 12,
+	MAX_RX_ADD_ENTRIES_PER_SUBCRQ = 13,
+	REQ_TX_ENTRIES_PER_SUBCRQ = 14,
+	REQ_RX_ADD_ENTRIES_PER_SUBCRQ = 15,
+	TCP_IP_OFFLOAD = 16,
+	PROMISC_REQUESTED = 17,
+	PROMISC_SUPPORTED = 18,
+	MIN_MTU = 19,
+	MAX_MTU = 20,
+	REQ_MTU = 21,
+	MAX_MULTICAST_FILTERS = 22,
+	VLAN_HEADER_INSERTION = 23,
+	MAX_TX_SG_ENTRIES = 25,
+	RX_SG_SUPPORTED = 26,
+	RX_SG_REQUESTED = 27,
+};
+
+enum vnic_error_cause {
+	ADAPTER_PROBLEM = 0,
+	BUS_PROBLEM = 1,
+	FW_PROBLEM = 2,
+	DD_PROBLEM = 3,
+	EEH_RECOVERY = 4,
+	FW_UPDATED = 5,
+	LOW_MEMORY = 6,
+};
+
+enum vnic_commands {
+	VERSION_EXCHANGE = 0x01,
+	VERSION_EXCHANGE_RSP = 0x81,
+	QUERY_CAPABILITY = 0x02,
+	QUERY_CAPABILITY_RSP = 0x82,
+	REQUEST_CAPABILITY = 0x03,
+	REQUEST_CAPABILITY_RSP = 0x83,
+	LOGIN = 0x04,
+	LOGIN_RSP = 0x84,
+	QUERY_PHYS_PARMS = 0x05,
+	QUERY_PHYS_PARMS_RSP = 0x85,
+	QUERY_PHYS_CAPABILITIES = 0x06,
+	QUERY_PHYS_CAPABILITIES_RSP = 0x86,
+	SET_PHYS_PARMS = 0x07,
+	SET_PHYS_PARMS_RSP = 0x87,
+	ERROR_INDICATION = 0x08,
+	REQUEST_ERROR_INFO = 0x09,
+	REQUEST_ERROR_RSP = 0x89,
+	REQUEST_DUMP_SIZE = 0x0A,
+	REQUEST_DUMP_SIZE_RSP = 0x8A,
+	REQUEST_DUMP = 0x0B,
+	REQUEST_DUMP_RSP = 0x8B,
+	LOGICAL_LINK_STATE = 0x0C,
+	LOGICAL_LINK_STATE_RSP = 0x8C,
+	REQUEST_STATISTICS = 0x0D,
+	REQUEST_STATISTICS_RSP = 0x8D,
+	REQUEST_RAS_COMP_NUM = 0x0E,
+	REQUEST_RAS_COMP_NUM_RSP = 0x8E,
+	REQUEST_RAS_COMPS = 0x0F,
+	REQUEST_RAS_COMPS_RSP = 0x8F,
+	CONTROL_RAS = 0x10,
+	CONTROL_RAS_RSP = 0x90,
+	COLLECT_FW_TRACE = 0x11,
+	COLLECT_FW_TRACE_RSP = 0x91,
+	LINK_STATE_INDICATION = 0x12,
+	CHANGE_MAC_ADDR = 0x13,
+	CHANGE_MAC_ADDR_RSP = 0x93,
+	MULTICAST_CTRL = 0x14,
+	MULTICAST_CTRL_RSP = 0x94,
+	GET_VPD_SIZE = 0x15,
+	GET_VPD_SIZE_RSP = 0x95,
+	GET_VPD = 0x16,
+	GET_VPD_RSP = 0x96,
+	TUNE = 0x17,
+	TUNE_RSP = 0x97,
+	QUERY_IP_OFFLOAD = 0x18,
+	QUERY_IP_OFFLOAD_RSP = 0x98,
+	CONTROL_IP_OFFLOAD = 0x19,
+	CONTROL_IP_OFFLOAD_RSP = 0x99,
+	ACL_CHANGE_INDICATION = 0x1A,
+	ACL_QUERY = 0x1B,
+	ACL_QUERY_RSP = 0x9B,
+	REQUEST_DEBUG_STATS = 0x1C,
+	REQUEST_DEBUG_STATS_RSP = 0x9C,
+};
+
+enum vnic_crq_type {
+	VNIC_CRQ_CMD			= 0x80,
+	VNIC_CRQ_CMD_RSP		= 0x80,
+	VNIC_CRQ_INIT_CMD		= 0xC0,
+	VNIC_CRQ_INIT_RSP		= 0xC0,
+	VNIC_CRQ_XPORT_EVENT		= 0xFF,
+};
+
+enum ibmvfc_crq_format {
+	VNIC_CRQ_INIT                 = 0x01,
+	VNIC_CRQ_INIT_COMPLETE        = 0x02,
+	VNIC_PARTITION_MIGRATED       = 0x06,
+};
+
+struct vnic_crq_queue {
+	union vnic_crq *msgs;
+	int size, cur;
+	dma_addr_t msg_token;
+	spinlock_t lock;
+};
+
+union sub_crq {
+	struct vnic_generic_scrq generic;
+	struct vnic_tx_comp_desc tx_comp;
+	struct vnic_tx_desc_v0 v0;
+	struct vnic_tx_desc_v1 v1;
+	struct vnic_tx_desc_v2 v2;
+	struct vnic_rx_desc rx_comp;
+	struct vnic_rx_buff_add_desc rx_add;
+};
+
+struct vnic_sub_crq_queue {
+	union sub_crq *msgs;
+	int size, cur;
+	dma_addr_t msg_token;
+	unsigned long crq_num;
+	unsigned long hw_irq;
+	unsigned int irq;
+	unsigned int pool_index;
+	int scrq_num;
+	spinlock_t lock;
+	struct sk_buff *rx_skb_top;
+	struct vnic_adapter *adapter;
+};
+
+struct vnic_tx_buff {
+	struct sk_buff *skb;
+	dma_addr_t data_dma[VNIC_MAX_FRAGS_PER_CRQ];
+	unsigned int data_len[VNIC_MAX_FRAGS_PER_CRQ];
+	int index;
+	int pool_index;
+	int last_frag;
+	int used_bounce;
+};
+
+struct vnic_tx_pool {
+	struct vnic_tx_buff *tx_buff;
+	int *free_map;
+	int consumer_index;
+	int producer_index;
+	wait_queue_head_t vnic_tx_comp_q;
+	struct task_struct *work_thread;
+};
+
+struct vnic_rx_buff {
+	struct sk_buff *skb;
+	dma_addr_t dma;
+	int size;
+	int pool_index;
+};
+
+struct vnic_rx_pool {
+	struct vnic_rx_buff *rx_buff;
+	int size;
+	int index;
+	int buff_size;
+	atomic_t available;
+	int *free_map;
+	int next_free;
+	int next_alloc;
+	int active;
+};
+
+struct vnic_error_buff {
+	char *buff;
+	dma_addr_t dma;
+	int len;
+	struct list_head list;
+	__be32 error_id;
+};
+
+struct vnic_fw_comp_internal {
+	struct vnic_adapter *adapter;
+	int num;
+	struct debugfs_blob_wrapper desc_blob;
+	int paused;
+};
+
+struct vnic_inflight_cmd {
+	union vnic_crq crq;
+	struct list_head list;
+};
+
+struct vnic_adapter {
+	struct vio_dev *vdev;
+	struct net_device *netdev;
+	struct vnic_crq_queue crq;
+	u8 mac_addr[ETH_ALEN];
+	struct vnic_query_ip_offload_buffer ip_offload_buf;
+	dma_addr_t ip_offload_tok;
+	struct vnic_control_ip_offload_buffer ip_offload_ctrl;
+	dma_addr_t ip_offload_ctrl_tok;
+	int migrated;
+	u32 msg_enable;
+	void *bounce_buffer;
+	int bounce_buffer_size;
+	dma_addr_t bounce_buffer_dma;
+
+	/* Statistics */
+	struct net_device_stats net_stats;
+	struct vnic_statistics stats;
+	dma_addr_t stats_token;
+	struct completion stats_done;
+	spinlock_t stats_lock;
+	int replenish_no_mem;
+	int replenish_add_buff_success;
+	int replenish_add_buff_failure;
+	int replenish_task_cycles;
+	int tx_send_failed;
+	int tx_map_failed;
+
+	int phys_link_state;
+	int logical_link_state;
+
+	/* login data */
+	struct vnic_login_buffer *login_buf;
+	dma_addr_t login_buf_token;
+	int login_buf_sz;
+
+	struct vnic_login_rsp_buffer *login_rsp_buf;
+	dma_addr_t login_rsp_buf_token;
+	int login_rsp_buf_sz;
+
+	atomic_t running_cap_queries;
+
+	struct vnic_sub_crq_queue **tx_scrq;
+	struct vnic_sub_crq_queue **rx_scrq;
+	int requested_caps;
+
+	/* rx structs */
+	struct napi_struct *napi;
+	struct vnic_rx_pool *rx_pool;
+	u64 promisc;
+
+	struct vnic_tx_pool *tx_pool;
+	int closing;
+	struct completion init_done;
+
+	struct list_head errors;
+	spinlock_t error_list_lock;
+
+	/* debugfs */
+	struct dentry *debugfs_dir;
+	struct dentry *debugfs_dump;
+	struct completion fw_done;
+	char *dump_data;
+	dma_addr_t dump_data_token;
+	int dump_data_size;
+	int ras_comp_num;
+	struct vnic_fw_component *ras_comps;
+	struct vnic_fw_comp_internal *ras_comp_int;
+	dma_addr_t ras_comps_tok;
+	struct dentry *ras_comps_ent;
+
+	/* in-flight commands that allocate and/or map memory*/
+	struct list_head inflight;
+	spinlock_t inflight_lock;
+
+	/* partner capabilities */
+	u64 min_tx_queues;
+	u64 min_rx_queues;
+	u64 min_rx_add_queues;
+	u64 max_tx_queues;
+	u64 max_rx_queues;
+	u64 max_rx_add_queues;
+	u64 req_tx_queues;
+	u64 req_rx_queues;
+	u64 req_rx_add_queues;
+	u64 min_tx_entries_per_subcrq;
+	u64 min_rx_add_entries_per_subcrq;
+	u64 max_tx_entries_per_subcrq;
+	u64 max_rx_add_entries_per_subcrq;
+	u64 req_tx_entries_per_subcrq;
+	u64 req_rx_add_entries_per_subcrq;
+	u64 tcp_ip_offload;
+	u64 promisc_requested;
+	u64 promisc_supported;
+	u64 min_mtu;
+	u64 max_mtu;
+	u64 req_mtu;
+	u64 max_multicast_filters;
+	u64 vlan_header_insertion;
+	u64 max_tx_sg_entries;
+	u64 rx_sg_supported;
+	u64 rx_sg_requested;
+};
